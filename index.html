@@ -266,6 +266,7 @@ var ALLOWED_EMAIL = "sasaki0369@gmail.com";
 var CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 var TITLE_PREFIX = "【会議録】";
 var TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // Firebase発行のOAuthアクセストークンは約1時間有効。安全側で50分。
+var PENDING_IMPORT_KEY = "o2g_pending_import";
 
 firebase.initializeApp(firebaseConfig);
 var auth = firebase.auth();
@@ -281,6 +282,32 @@ var monthFilterValue = "all";
 var searchValue = "";
 var unimportedOnlyValue = false;
 var deferredInstallPrompt = null;
+var pendingImportIds = null; // Google再認証(リダイレクト)から戻った直後に再開する取込ID一覧
+
+// GitHub PagesはCross-Origin-Opener-Policyヘッダーを送出しており、
+// signInWithPopup()のポップアップ監視(window.closed)がブラウザにブロックされてしまう。
+// そのため本アプリはポップアップ方式を使わず、常にsignInWithRedirect(全画面遷移)で認証する。
+function savePendingImport(ids){
+  try{ sessionStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(ids)); }catch(e){ /* no-op */ }
+}
+function loadPendingImport(){
+  try{
+    var raw = sessionStorage.getItem(PENDING_IMPORT_KEY);
+    if(!raw) return null;
+    sessionStorage.removeItem(PENDING_IMPORT_KEY);
+    var ids = JSON.parse(raw);
+    return Array.isArray(ids) && ids.length ? ids : null;
+  }catch(e){ return null; }
+}
+function maybeResumePendingImport(){
+  if(!pendingImportIds || !accessToken) return;
+  if(!Object.keys(eventsById).length) return; // Firebaseの初回読み込み待ち
+  var ids = pendingImportIds.filter(function(id){
+    return eventsById[id] && !eventsById[id].importedToGoogle;
+  });
+  pendingImportIds = null;
+  if(ids.length) runImport(ids, accessToken);
+}
 
 /* ========================= ユーティリティ ========================= */
 function $(id){ return document.getElementById(id); }
@@ -517,20 +544,7 @@ function buildGoogleProvider(){
 
 $("signInBtn").addEventListener("click", function(){
   $("signinError").style.display = "none";
-  auth.signInWithPopup(buildGoogleProvider()).then(function(result){
-    var email = result.user && result.user.email;
-    if(email !== ALLOWED_EMAIL){
-      auth.signOut();
-      $("signinError").style.display = "block";
-      $("signinError").textContent = "このアプリは " + ALLOWED_EMAIL + " 専用です。別のアカウントでログインされました。";
-      return;
-    }
-    var cred = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-    if(cred && cred.accessToken){
-      accessToken = cred.accessToken;
-      accessTokenAt = Date.now();
-    }
-  }).catch(function(err){
+  auth.signInWithRedirect(buildGoogleProvider()).catch(function(err){
     console.error(err);
     $("signinError").style.display = "block";
     $("signinError").textContent = "ログインに失敗しました: " + err.message;
@@ -542,27 +556,38 @@ $("signOutBtn").addEventListener("click", function(){
 });
 
 $("refreshTokenBtn").addEventListener("click", function(){
-  requestFreshToken(true);
+  showToast("Googleのログイン画面に移動します…", "ok");
+  setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
 });
 
-function requestFreshToken(interactive){
-  return auth.signInWithPopup(buildGoogleProvider()).then(function(result){
-    var cred = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-    if(cred && cred.accessToken){
-      accessToken = cred.accessToken;
-      accessTokenAt = Date.now();
-      if(interactive) showToast("Googleカレンダーへのアクセス権を更新しました", "ok");
-      return accessToken;
-    }
-    throw new Error("アクセストークンを取得できませんでした");
-  });
-}
-
-function getValidAccessToken(){
-  if(accessToken && (Date.now() - accessTokenAt) < TOKEN_MAX_AGE_MS){
-    return Promise.resolve(accessToken);
+// リダイレクトで戻ってきた直後に一度だけ呼ばれる。認証結果からGoogleカレンダー用の
+// アクセストークンを取り出し、保留中の取込があれば自動的に再開する。
+auth.getRedirectResult().then(function(result){
+  if(!result || !result.user) return;
+  var email = result.user.email;
+  if(email !== ALLOWED_EMAIL){
+    auth.signOut();
+    $("signinError").style.display = "block";
+    $("signinError").textContent = "このアプリは " + ALLOWED_EMAIL + " 専用です。別のアカウントでログインされました。";
+    return;
   }
-  return requestFreshToken(false);
+  var cred = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+  if(cred && cred.accessToken){
+    accessToken = cred.accessToken;
+    accessTokenAt = Date.now();
+    showToast("Googleカレンダーへのアクセス権を確認しました", "ok");
+    maybeResumePendingImport();
+  } else {
+    showToast("Googleカレンダーへのアクセス権を取得できませんでした。データアクセスのスコープ設定をご確認ください。", "err");
+  }
+}).catch(function(err){
+  console.error(err);
+  $("signinError").style.display = "block";
+  $("signinError").textContent = "ログインに失敗しました: " + err.message;
+});
+
+function hasValidAccessToken(){
+  return !!(accessToken && (Date.now() - accessTokenAt) < TOKEN_MAX_AGE_MS);
 }
 
 auth.onAuthStateChanged(function(user){
@@ -636,6 +661,7 @@ function rebuildMonthOptions(){
 
 function render(){
   rebuildMonthOptions();
+  maybeResumePendingImport();
   var ids = getFilteredSortedIds();
   var root = $("listRoot");
 
@@ -745,7 +771,13 @@ $("importBtn").addEventListener("click", function(){
     return ev && ev.selected && !ev.importedToGoogle;
   });
   if(!selIds.length) return;
-  runImport(selIds);
+  if(!hasValidAccessToken()){
+    savePendingImport(selIds);
+    showToast("カレンダーへのアクセス権を確認します。Googleのログイン画面に移動します…", "ok");
+    setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
+    return;
+  }
+  runImport(selIds, accessToken);
 });
 
 function eventToGoogleBody(ev){
@@ -765,22 +797,32 @@ function eventToGoogleBody(ev){
   return body;
 }
 
-function runImport(ids){
+function runImport(ids, token){
   $("progressBg").style.display = "flex";
   $("progressBar").style.width = "0%";
   $("progressMsg").textContent = "0 / " + ids.length + " 件";
 
   var ok = 0, fail = 0, failMessages = [];
 
-  function step(i, token){
-    if(i >= ids.length){
-      $("progressBg").style.display = "none";
-      var msg = "取込完了: 成功 " + ok + " 件";
-      if(fail) msg += " / 失敗 " + fail + " 件";
-      showToast(msg, fail ? "err" : "ok");
-      if(failMessages.length) console.warn("Import failures:", failMessages);
-      return;
-    }
+  function finish(){
+    $("progressBg").style.display = "none";
+    var msg = "取込完了: 成功 " + ok + " 件";
+    if(fail) msg += " / 失敗 " + fail + " 件";
+    showToast(msg, fail ? "err" : "ok");
+    if(failMessages.length) console.warn("Import failures:", failMessages);
+  }
+
+  // トークンが途中で失効(401)した場合は、残りの予定IDを保存していったん
+  // 再認証(リダイレクト)へ。戻ってきたら自動的に残りを再開する。
+  function reauthAndResume(remainingIds){
+    $("progressBg").style.display = "none";
+    savePendingImport(remainingIds);
+    showToast("アクセス権限の期限が切れました。再度Googleへのログインが必要です…", "err");
+    setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 800);
+  }
+
+  function step(i){
+    if(i >= ids.length){ finish(); return; }
     var id = ids[i];
     var ev = eventsById[id];
     var payload = eventToGoogleBody(ev);
@@ -790,20 +832,10 @@ function runImport(ids){
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     }).then(function(res){
-      if(res.status === 401){
-        return requestFreshToken(false).then(function(newToken){
-          return fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
-            method: "POST",
-            headers: { "Authorization": "Bearer " + newToken, "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          }).then(function(res2){ return {res: res2, token: newToken}; });
-        });
-      }
-      return {res: res, token: token};
-    }).then(function(o){
-      var res = o.res, useToken = o.token;
-      return res.json().then(function(data){ return {res:res, data:data, token:useToken}; });
+      if(res.status === 401) return { unauthorized: true };
+      return res.json().then(function(data){ return {res:res, data:data}; });
     }).then(function(r){
+      if(r.unauthorized){ reauthAndResume(ids.slice(i)); return; }
       if(r.res.ok){
         ok++;
         db.ref("events/" + id).update({
@@ -817,22 +849,17 @@ function runImport(ids){
       }
       $("progressBar").style.width = Math.round(((i+1)/ids.length)*100) + "%";
       $("progressMsg").textContent = (i+1) + " / " + ids.length + " 件";
-      step(i+1, r.token);
+      step(i+1);
     }).catch(function(err){
       fail++;
       failMessages.push((ev.subject||id) + ": " + err.message);
       $("progressBar").style.width = Math.round(((i+1)/ids.length)*100) + "%";
       $("progressMsg").textContent = (i+1) + " / " + ids.length + " 件";
-      step(i+1, token);
+      step(i+1);
     });
   }
 
-  getValidAccessToken().then(function(token){
-    step(0, token);
-  }).catch(function(err){
-    $("progressBg").style.display = "none";
-    showToast("Googleカレンダーへのアクセス権を取得できませんでした: " + err.message, "err");
-  });
+  step(0);
 }
 
 /* ========================= PWAインストール ========================= */
@@ -853,30 +880,11 @@ window.addEventListener("appinstalled", function(){
   $("installBanner").style.display = "none";
 });
 
-if("serviceWorker" in navigator){
-  var swSource = [
-    'const CACHE_NAME = "o2g-shell-v1";',
-    'self.addEventListener("install", (e) => { self.skipWaiting(); });',
-    'self.addEventListener("activate", (e) => { e.waitUntil(self.clients.claim()); });',
-    'self.addEventListener("fetch", (e) => {',
-    '  if(e.request.method !== "GET") return;',
-    '  e.respondWith(',
-    '    fetch(e.request).then((res) => {',
-    '      const clone = res.clone();',
-    '      caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));',
-    '      return res;',
-    '    }).catch(() => caches.match(e.request))',
-    '  );',
-    '});'
-  ].join("\n");
-  var swBlob = new Blob([swSource], {type: "text/javascript"});
-  var swUrl = URL.createObjectURL(swBlob);
-  window.addEventListener("load", function(){
-    navigator.serviceWorker.register(swUrl).catch(function(err){
-      console.warn("Service worker registration failed:", err);
-    });
-  });
-}
+// 注記: Service WorkerはHTTP(S)配信の同一オリジンJSファイルとしてしか登録できず、
+// blob:/data: URLからの登録はChromium/Edgeでは許可されない仕様のため、
+// 単一HTMLファイルという制約の中では登録を行わない。
+// 最新のChrome/Edge/Androidはmanifest+HTTPSのみでインストール可能と判定するため、
+// 「ホーム画面に追加」自体はService Workerなしでも問題なく動作する。
 
 })();
 </script>
