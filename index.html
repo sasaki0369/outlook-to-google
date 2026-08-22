@@ -214,10 +214,10 @@
         <button class="btn btn-ghost btn-sm" id="refreshTokenBtn" type="button">🔄 カレンダー権限を更新</button>
       </div>
       <div class="filterrow">
-        <select id="monthFilter"></select>
         <input type="search" id="searchInput" placeholder="件名・場所で検索">
         <label class="togglechip"><input type="checkbox" id="unimportedOnly">未取込のみ</label>
       </div>
+      <div class="status-line" id="windowLine"></div>
       <div class="status-line" id="statusLine">CSVを取り込むと、ここに予定一覧が表示されます。</div>
     </div>
 
@@ -278,7 +278,7 @@ var accessToken = null;
 var accessTokenAt = 0;
 var eventsById = {};         // Firebaseから同期される全予定
 var selected = {};           // {id: true} ローカル選択状態(Firebaseにも保存)
-var monthFilterValue = "all";
+var lastImportAt = null;     // 直近のCSV取込日時(ms) - 表示対象期間の起点としてFirebaseで端末間共有
 var searchValue = "";
 var unimportedOnlyValue = false;
 var deferredInstallPrompt = null;
@@ -350,6 +350,15 @@ function addDaysToDateKey(key, n){
   var dt = new Date(Date.UTC(parts[0], parts[1]-1, parts[2]));
   dt.setUTCDate(dt.getUTCDate() + n);
   return dt.getUTCFullYear() + "-" + pad2(dt.getUTCMonth()+1) + "-" + pad2(dt.getUTCDate());
+}
+// タイムスタンプ(ms)を端末のローカルタイムゾーンでの日付キーに変換(取込日時の起点計算用)
+function dateKeyFromTimestamp(ts){
+  var d = new Date(ts);
+  return d.getFullYear() + "-" + pad2(d.getMonth()+1) + "-" + pad2(d.getDate());
+}
+function formatShortDate(key){
+  var parts = key.split("-").map(Number);
+  return parts[1] + "月" + parts[2] + "日(" + WEEKDAY_JA[weekdayOf(key)] + ")";
 }
 var WEEKDAY_JA = ["日","月","火","水","木","金","土"];
 function weekdayOf(key){
@@ -483,6 +492,7 @@ $("csvInput").addEventListener("change", function(ev){
 function mergeIntoFirebase(parsedEvents){
   var updates = {};
   var newCount = 0, updateCount = 0;
+  var importTimestamp = Date.now();
   parsedEvents.forEach(function(ev){
     var id = stableEventId(ev);
     var existing = eventsById[id];
@@ -496,25 +506,26 @@ function mergeIntoFirebase(parsedEvents){
       location: ev.location,
       body: ev.body,
       category: ev.category,
-      updatedAt: Date.now()
+      updatedAt: importTimestamp,
+      selected: false // CSV取込のたびに選択状態は必ず未チェックへリセットする
     };
     if(existing){
-      payload.selected = !!existing.selected;
       payload.importedToGoogle = !!existing.importedToGoogle;
       payload.googleEventId = existing.googleEventId || null;
       payload.importedAt = existing.importedAt || null;
-      payload.createdAt = existing.createdAt || Date.now();
+      payload.createdAt = existing.createdAt || importTimestamp;
       updateCount++;
     } else {
-      payload.selected = false;
       payload.importedToGoogle = false;
       payload.googleEventId = null;
       payload.importedAt = null;
-      payload.createdAt = Date.now();
+      payload.createdAt = importTimestamp;
       newCount++;
     }
     updates["events/" + id] = payload;
   });
+  // 表示対象期間(取込日時から7日間)の起点として、最終取込日時を端末間で共有する
+  updates["meta/lastImportAt"] = importTimestamp;
   db.ref().update(updates).then(function(){
     showToast(parsedEvents.length + "件読み込み完了(新規 " + newCount + "件 / 更新 " + updateCount + "件)", "ok");
   }).catch(function(err){
@@ -531,6 +542,12 @@ function listenEvents(){
   }, function(err){
     console.error(err);
     showToast("データの取得に失敗しました: " + err.message, "err");
+  });
+}
+function listenMeta(){
+  db.ref("meta/lastImportAt").on("value", function(snap){
+    lastImportAt = snap.val() || null;
+    render();
   });
 }
 
@@ -598,6 +615,7 @@ auth.onAuthStateChanged(function(user){
     $("userChip").style.display = "flex";
     $("userEmail").textContent = user.email;
     listenEvents();
+    listenMeta();
   } else {
     currentUser = null;
     $("signinScreen").style.display = "block";
@@ -607,18 +625,27 @@ auth.onAuthStateChanged(function(user){
 });
 
 /* ========================= フィルタ/描画 ========================= */
-$("monthFilter").addEventListener("change", function(e){ monthFilterValue = e.target.value; render(); });
 $("searchInput").addEventListener("input", function(e){ searchValue = e.target.value.trim(); render(); });
 $("unimportedOnly").addEventListener("change", function(e){ unimportedOnlyValue = e.target.checked; render(); });
 
+// 表示対象期間: 最終CSV取込日時を起点に、その日から7日間先まで(8日間)。
+// この期間外の予定はチェック候補としては一切表示しない。
+function getDisplayWindow(){
+  var anchor = lastImportAt || Date.now();
+  var start = dateKeyFromTimestamp(anchor);
+  var end = addDaysToDateKey(start, 7);
+  return { start: start, end: end };
+}
+
 function getFilteredSortedIds(){
+  var win = getDisplayWindow();
   var ids = Object.keys(eventsById);
   ids = ids.filter(function(id){
     var ev = eventsById[id];
     if(!ev) return false;
     if(unimportedOnlyValue && ev.importedToGoogle) return false;
     var key = dateKey(ev.startDate);
-    if(monthFilterValue !== "all" && key.slice(0,7) !== monthFilterValue) return false;
+    if(key < win.start || key > win.end) return false;
     if(searchValue){
       var hay = (ev.subject||"") + " " + (ev.location||"");
       if(hay.toLowerCase().indexOf(searchValue.toLowerCase()) === -1) return false;
@@ -634,34 +661,14 @@ function getFilteredSortedIds(){
   return ids;
 }
 
-function rebuildMonthOptions(){
-  var months = {};
-  Object.keys(eventsById).forEach(function(id){
-    var ev = eventsById[id];
-    if(!ev) return;
-    months[dateKey(ev.startDate).slice(0,7)] = true;
-  });
-  var list = Object.keys(months).sort();
-  var sel = $("monthFilter");
-  var prev = sel.value || "all";
-  sel.innerHTML = "";
-  var optAll = document.createElement("option");
-  optAll.value = "all"; optAll.textContent = "すべての期間";
-  sel.appendChild(optAll);
-  list.forEach(function(m){
-    var opt = document.createElement("option");
-    opt.value = m;
-    var parts = m.split("-");
-    opt.textContent = parts[0] + "年" + parseInt(parts[1],10) + "月";
-    sel.appendChild(opt);
-  });
-  if(list.indexOf(prev) !== -1 || prev === "all"){ sel.value = prev; monthFilterValue = prev; }
-  else { sel.value = "all"; monthFilterValue = "all"; }
-}
-
 function render(){
-  rebuildMonthOptions();
   maybeResumePendingImport();
+  var win = getDisplayWindow();
+  if(Object.keys(eventsById).length){
+    $("windowLine").textContent = "表示期間: " + formatShortDate(win.start) + " 〜 " + formatShortDate(win.end) + "（取込日時を起点に7日間。範囲外の予定は表示されません）";
+  } else {
+    $("windowLine").textContent = "";
+  }
   var ids = getFilteredSortedIds();
   var root = $("listRoot");
 
@@ -672,7 +679,7 @@ function render(){
     return;
   }
   if(!ids.length){
-    root.innerHTML = '<div class="empty">🔍<br>条件に一致する予定がありません。</div>';
+    root.innerHTML = '<div class="empty">🔍<br>表示期間内（' + formatShortDate(win.start) + '〜' + formatShortDate(win.end) + '）に該当する予定がありません。<br>検索条件や「未取込のみ」の設定もご確認ください。</div>';
     $("statusLine").textContent = "全 " + Object.keys(eventsById).length + " 件中 0 件を表示";
     updateFabBar(ids);
     return;
