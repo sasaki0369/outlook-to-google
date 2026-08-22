@@ -182,7 +182,6 @@
     <div class="spacer"></div>
     <div class="userchip" id="userChip" style="display:none;">
       <span id="userEmail"></span>
-      <button id="signOutBtn" type="button">ログアウト</button>
     </div>
   </div>
 </header>
@@ -229,7 +228,7 @@
 <div class="fab-bar" id="fabBar" style="display:none;">
   <div class="fab-inner">
     <div class="selcount"><b id="selCount">0</b> 件選択中</div>
-    <button class="btn btn-outline btn-sm" id="selectAllVisibleBtn" type="button">表示中を全選択</button>
+    <button class="btn btn-outline btn-sm" id="deselectAllVisibleBtn" type="button">表示中を全解除</button>
     <button class="btn btn-primary" id="importBtn" type="button" disabled>Googleカレンダーに取り込む</button>
   </div>
 </div>
@@ -568,10 +567,6 @@ $("signInBtn").addEventListener("click", function(){
   });
 });
 
-$("signOutBtn").addEventListener("click", function(){
-  auth.signOut();
-});
-
 $("refreshTokenBtn").addEventListener("click", function(){
   showToast("Googleのログイン画面に移動します…", "ok");
   setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
@@ -751,12 +746,12 @@ $("listRoot").addEventListener("click", function(e){
   }
 });
 
-$("selectAllVisibleBtn").addEventListener("click", function(){
+$("deselectAllVisibleBtn").addEventListener("click", function(){
   var ids = getFilteredSortedIds();
   var updates = {};
   ids.forEach(function(id){
     var ev = eventsById[id];
-    if(ev && !ev.importedToGoogle) updates["events/" + id + "/selected"] = true;
+    if(ev && !ev.importedToGoogle) updates["events/" + id + "/selected"] = false;
   });
   db.ref().update(updates);
 });
