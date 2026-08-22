@@ -214,7 +214,7 @@
       </div>
       <div class="filterrow">
         <input type="search" id="searchInput" placeholder="件名・場所で検索">
-        <label class="togglechip"><input type="checkbox" id="unimportedOnly">未取込のみ</label>
+        <label class="togglechip"><input type="checkbox" id="unimportedOnly" checked>未取込のみ</label>
       </div>
       <div class="status-line" id="windowLine"></div>
       <div class="status-line" id="statusLine">CSVを取り込むと、ここに予定一覧が表示されます。</div>
@@ -279,7 +279,7 @@ var eventsById = {};         // Firebaseから同期される全予定
 var selected = {};           // {id: true} ローカル選択状態(Firebaseにも保存)
 var lastImportAt = null;     // 直近のCSV取込日時(ms) - 表示対象期間の起点としてFirebaseで端末間共有
 var searchValue = "";
-var unimportedOnlyValue = false;
+var unimportedOnlyValue = true; // デフォルトで「未取込のみ」表示。HTML側のcheckedと合わせる
 var deferredInstallPrompt = null;
 var pendingImportIds = null; // Google再認証(リダイレクト)から戻った直後に再開する取込ID一覧
 
@@ -373,6 +373,23 @@ function combineDateTime(startDateStr, timeStr){
   var p = parseOutlookDate(startDateStr);
   var t = (timeStr || "00:00:00");
   return p.y + "-" + pad2(p.m) + "-" + pad2(p.d) + "T" + t + "+09:00";
+}
+// Outlookの時刻表記は"9:00:00"のように時が1桁のことがあり、文字列比較のままでは
+// 正しい時系列順に並ばない("9:00:00" > "17:00:00"になる)ため、数値化して比較する。
+function timeToSeconds(t){
+  if(!t) return 0;
+  var parts = String(t).split(":");
+  var h = parseInt(parts[0], 10) || 0;
+  var m = parseInt(parts[1], 10) || 0;
+  var s = parseInt(parts[2], 10) || 0;
+  return h * 3600 + m * 60 + s;
+}
+function formatTimeShort(t){
+  if(!t) return "";
+  var parts = String(t).split(":");
+  var h = parseInt(parts[0], 10) || 0;
+  var m = parseInt(parts[1], 10) || 0;
+  return pad2(h) + ":" + pad2(m);
 }
 
 // 32bit FNV-1aを2系統かけあわせて衝突しにくい安定IDを作る(Firebaseキーとして使用)
@@ -523,6 +540,15 @@ function mergeIntoFirebase(parsedEvents){
     }
     updates["events/" + id] = payload;
   });
+  // 今回のCSVに含まれなかった予定でも、選択状態が残っていれば必ずリセットする
+  // (表示期間の外に残っていた古い選択が、件数カウントに紛れ込むのを防ぐ)
+  Object.keys(eventsById).forEach(function(id){
+    if(updates["events/" + id] !== undefined) return; // 上のループで既に選択リセット済み
+    var ev = eventsById[id];
+    if(ev && ev.selected){
+      updates["events/" + id + "/selected"] = false;
+    }
+  });
   // 表示対象期間(取込日時から7日間)の起点として、最終取込日時を端末間で共有する
   updates["meta/lastImportAt"] = importTimestamp;
   db.ref().update(updates).then(function(){
@@ -632,15 +658,25 @@ function getDisplayWindow(){
   return { start: start, end: end };
 }
 
-function getFilteredSortedIds(){
+// チェック候補となりうる予定: 表示期間(7日間)内、かつ終日イベントを除いたもの。
+// 選択件数の集計やGoogleカレンダー取込の対象は、常にこの範囲に限定する
+// (期間外や終日イベントに残った古い選択状態が紛れ込まないようにするため)。
+function getCandidateIds(){
   var win = getDisplayWindow();
-  var ids = Object.keys(eventsById);
-  ids = ids.filter(function(id){
+  return Object.keys(eventsById).filter(function(id){
     var ev = eventsById[id];
     if(!ev) return false;
-    if(unimportedOnlyValue && ev.importedToGoogle) return false;
+    if(ev.allDay) return false;
     var key = dateKey(ev.startDate);
     if(key < win.start || key > win.end) return false;
+    return true;
+  });
+}
+
+function getFilteredSortedIds(){
+  var ids = getCandidateIds().filter(function(id){
+    var ev = eventsById[id];
+    if(unimportedOnlyValue && ev.importedToGoogle) return false;
     if(searchValue){
       var hay = (ev.subject||"") + " " + (ev.location||"");
       if(hay.toLowerCase().indexOf(searchValue.toLowerCase()) === -1) return false;
@@ -649,9 +685,12 @@ function getFilteredSortedIds(){
   });
   ids.sort(function(a,b){
     var ea = eventsById[a], eb = eventsById[b];
-    var ka = dateKey(ea.startDate) + " " + (ea.startTime||"");
-    var kb = dateKey(eb.startDate) + " " + (eb.startTime||"");
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+    var ka = dateKey(ea.startDate), kb = dateKey(eb.startDate);
+    if(ka !== kb) return ka < kb ? -1 : 1;
+    var sa = timeToSeconds(ea.startTime), sb = timeToSeconds(eb.startTime);
+    if(sa !== sb) return sa - sb;
+    var eaEnd = timeToSeconds(ea.endTime), ebEnd = timeToSeconds(eb.endTime);
+    return eaEnd - ebEnd;
   });
   return ids;
 }
@@ -702,7 +741,7 @@ function render(){
     html += '</div>';
     groupMap[key].forEach(function(id){
       var ev = eventsById[id];
-      var timeStr = ev.allDay ? "終日" : (ev.startTime||"").slice(0,5) + "〜" + (ev.endTime||"").slice(0,5);
+      var timeStr = ev.allDay ? "終日" : formatTimeShort(ev.startTime) + "〜" + formatTimeShort(ev.endTime);
       var checked = ev.selected ? " checked" : "";
       var cardCls = ev.importedToGoogle ? " imported" : "";
       html += '<label class="card' + cardCls + '">';
@@ -738,7 +777,7 @@ $("listRoot").addEventListener("click", function(e){
     var updates = {};
     Object.keys(eventsById).forEach(function(id){
       var ev = eventsById[id];
-      if(ev && !ev.importedToGoogle && dateKey(ev.startDate) === key){
+      if(ev && !ev.importedToGoogle && !ev.allDay && dateKey(ev.startDate) === key){
         updates["events/" + id + "/selected"] = true;
       }
     });
@@ -757,7 +796,7 @@ $("deselectAllVisibleBtn").addEventListener("click", function(){
 });
 
 function updateFabBar(visibleIds){
-  var selIds = Object.keys(eventsById).filter(function(id){
+  var selIds = getCandidateIds().filter(function(id){
     var ev = eventsById[id];
     return ev && ev.selected && !ev.importedToGoogle;
   });
@@ -768,7 +807,7 @@ function updateFabBar(visibleIds){
 
 /* ========================= Googleカレンダー取込 ========================= */
 $("importBtn").addEventListener("click", function(){
-  var selIds = Object.keys(eventsById).filter(function(id){
+  var selIds = getCandidateIds().filter(function(id){
     var ev = eventsById[id];
     return ev && ev.selected && !ev.importedToGoogle;
   });
