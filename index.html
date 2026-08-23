@@ -305,8 +305,15 @@ function maybeResumePendingImport(){
     return eventsById[id] && !eventsById[id].importedToGoogle;
   });
   pendingImportIds = null;
-  if(ids.length) runImport(ids, accessToken);
+  if(ids.length){
+    showToast("ログインが完了しました。保留していた取込を再開します…", "ok");
+    runImport(ids, accessToken);
+  }
 }
+// ページ読み込み時点で、再認証リダイレクトの直前に保存しておいた取込予定IDがあれば復元しておく。
+// (これが無いと、リダイレクトから戻ってきてもどの予定を取り込む予定だったか分からず、
+//  取込が静かに何も起きないまま終わってしまう)
+pendingImportIds = loadPendingImport();
 
 /* ========================= ユーティリティ ========================= */
 function $(id){ return document.getElementById(id); }
