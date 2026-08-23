@@ -38,6 +38,36 @@
     -webkit-font-smoothing:antialiased;
     padding-bottom:100px;
   }
+  .debug-fab{
+    position:fixed; left:14px; bottom:14px; z-index:500;
+    width:40px; height:40px; border-radius:50%;
+    background:var(--card); border:1px solid var(--line); box-shadow:var(--shadow);
+    display:flex; align-items:center; justify-content:center;
+    font-size:18px; cursor:pointer; opacity:.85;
+  }
+  .debug-panel-bg{
+    position:fixed; inset:0; background:rgba(58,42,32,.35); z-index:600;
+    display:none; align-items:flex-end; justify-content:center;
+  }
+  .debug-panel{
+    width:100%; max-width:640px; max-height:70vh; background:var(--card);
+    border-radius:16px 16px 0 0; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .debug-panel-head{
+    display:flex; align-items:center; gap:8px; padding:10px 14px;
+    border-bottom:1px solid var(--line); font-weight:700; font-size:13px;
+  }
+  .debug-panel-body{
+    flex:1; overflow:auto; margin:0; padding:10px 14px;
+    font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-all;
+    color:var(--ink);
+  }
+  .debug-panel-foot{
+    display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line);
+  }
+  .debug-panel-head .spacer, .debug-panel-foot .spacer{flex:1;}
   a{color:var(--accent);}
   .container{max-width:720px;margin:0 auto;padding:0 14px;}
 
@@ -233,6 +263,24 @@
   </div>
 </div>
 
+<div class="debug-fab" id="debugFab" title="デバッグログ">🐞</div>
+<div class="debug-panel-bg" id="debugPanelBg">
+  <div class="debug-panel">
+    <div class="debug-panel-head">
+      <span>デバッグログ</span>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" id="debugCloseBtn" type="button">閉じる</button>
+    </div>
+    <pre class="debug-panel-body" id="debugPanelBody">(ログはまだありません)</pre>
+    <div class="debug-panel-foot">
+      <button class="btn btn-outline btn-sm" id="debugCopyBtn" type="button">コピー</button>
+      <button class="btn btn-outline btn-sm" id="debugClearBtn" type="button">クリア</button>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" id="debugRefreshBtn" type="button">更新</button>
+    </div>
+  </div>
+</div>
+
 <div class="progress-modal-bg" id="progressBg" style="display:none;">
   <div class="progress-modal">
     <div style="font-weight:700;font-size:14px;">Googleカレンダーに登録中…</div>
@@ -283,6 +331,89 @@ var unimportedOnlyValue = true; // デフォルトで「未取込のみ」表示
 var deferredInstallPrompt = null;
 var pendingImportIds = null; // Google再認証(リダイレクト)から戻った直後に再開する取込ID一覧
 
+/* ========================= デバッグログ =========================
+   OAuthのリダイレクト遷移をまたいでも消えないよう、console.logではなく
+   sessionStorageに記録し、画面上のパネル(🐞ボタン)からいつでも確認・コピーできるようにする。
+   DevToolsの「Preserve log」を探さなくても、この画面内パネルだけで状況を追える。 */
+var DEBUG_LOG_KEY = "o2g_debug_log";
+function debugLog(msg, data){
+  try{
+    var entry = { t: Date.now(), msg: String(msg), data: data };
+    var raw = sessionStorage.getItem(DEBUG_LOG_KEY);
+    var arr = raw ? JSON.parse(raw) : [];
+    arr.push(entry);
+    if(arr.length > 80) arr = arr.slice(arr.length - 80);
+    sessionStorage.setItem(DEBUG_LOG_KEY, JSON.stringify(arr));
+  }catch(e){}
+  try{ console.log("[o2g]", msg, data); }catch(e){}
+  renderDebugPanel();
+}
+function debugLogFormatted(){
+  var arr = [];
+  try{
+    var raw = sessionStorage.getItem(DEBUG_LOG_KEY);
+    arr = raw ? JSON.parse(raw) : [];
+  }catch(e){}
+  return arr.map(function(e){
+    var d = new Date(e.t);
+    var ts = pad2(d.getHours())+":"+pad2(d.getMinutes())+":"+pad2(d.getSeconds())+"."+String(d.getMilliseconds()).padStart(3,"0");
+    var dataStr = "";
+    if(e.data !== undefined){
+      try{ dataStr = JSON.stringify(e.data); }catch(err){ dataStr = String(e.data); }
+    }
+    return "["+ts+"] "+e.msg+(dataStr ? " " + dataStr : "");
+  }).join("\n");
+}
+function renderDebugPanel(){
+  var el = document.getElementById("debugPanelBody");
+  if(!el) return;
+  var text = debugLogFormatted();
+  el.textContent = text || "(ログはまだありません)";
+  el.scrollTop = el.scrollHeight;
+}
+document.getElementById("debugFab").addEventListener("click", function(){
+  renderDebugPanel();
+  document.getElementById("debugPanelBg").style.display = "flex";
+});
+document.getElementById("debugPanelBg").addEventListener("click", function(e){
+  if(e.target === this) this.style.display = "none";
+});
+document.getElementById("debugCloseBtn").addEventListener("click", function(){
+  document.getElementById("debugPanelBg").style.display = "none";
+});
+document.getElementById("debugRefreshBtn").addEventListener("click", function(){
+  renderDebugPanel();
+});
+document.getElementById("debugClearBtn").addEventListener("click", function(){
+  try{ sessionStorage.removeItem(DEBUG_LOG_KEY); }catch(e){}
+  renderDebugPanel();
+});
+document.getElementById("debugCopyBtn").addEventListener("click", function(){
+  var text = debugLogFormatted() || "(ログはまだありません)";
+  function fallbackCopy(){
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try{ document.execCommand("copy"); }catch(e){}
+    document.body.removeChild(ta);
+  }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){
+      showToast("ログをコピーしました", "ok");
+    }).catch(function(){
+      fallbackCopy();
+      showToast("ログをコピーしました", "ok");
+    });
+  } else {
+    fallbackCopy();
+    showToast("ログをコピーしました", "ok");
+  }
+});
+
 // GitHub PagesはCross-Origin-Opener-Policyヘッダーを送出しており、
 // signInWithPopup()のポップアップ監視(window.closed)がブラウザにブロックされてしまう。
 // そのため本アプリはポップアップ方式を使わず、常にsignInWithRedirect(全画面遷移)で認証する。
@@ -299,7 +430,7 @@ function loadPendingImport(){
   }catch(e){ return null; }
 }
 function maybeResumePendingImport(){
-  console.log("[o2g] maybeResumePendingImport check", {
+  debugLog("maybeResumePendingImport check", {
     pendingImportIds: pendingImportIds,
     hasAccessToken: !!accessToken,
     eventsLoaded: Object.keys(eventsById).length
@@ -310,7 +441,7 @@ function maybeResumePendingImport(){
     return eventsById[id] && !eventsById[id].importedToGoogle;
   });
   pendingImportIds = null;
-  console.log("[o2g] resuming import for", ids.length, "events");
+  debugLog("resuming import for N events", ids.length);
   if(ids.length){
     showToast("ログインが完了しました。保留していた取込を再開します…", "ok");
     runImport(ids, accessToken);
@@ -320,7 +451,8 @@ function maybeResumePendingImport(){
 // (これが無いと、リダイレクトから戻ってきてもどの予定を取り込む予定だったか分からず、
 //  取込が静かに何も起きないまま終わってしまう)
 pendingImportIds = loadPendingImport();
-console.log("[o2g] page load, restored pendingImportIds:", pendingImportIds);
+debugLog("page load, restored pendingImportIds", pendingImportIds);
+debugLog("page load, location.href", location.href);
 
 /* ========================= ユーティリティ ========================= */
 function $(id){ return document.getElementById(id); }
@@ -600,41 +732,57 @@ function buildGoogleProvider(){
 
 $("signInBtn").addEventListener("click", function(){
   $("signinError").style.display = "none";
+  debugLog("signInBtn clicked -> signInWithRedirect()", null);
   auth.signInWithRedirect(buildGoogleProvider()).catch(function(err){
-    console.error(err);
+    debugLog("signInWithRedirect() catch (signInBtn)", { code: err && err.code, message: err && err.message });
     $("signinError").style.display = "block";
     $("signinError").textContent = "ログインに失敗しました: " + err.message;
   });
 });
 
 $("refreshTokenBtn").addEventListener("click", function(){
+  debugLog("refreshTokenBtn clicked -> signInWithRedirect() (after 500ms)", null);
   showToast("Googleのログイン画面に移動します…", "ok");
   setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
 });
 
 // リダイレクトで戻ってきた直後に一度だけ呼ばれる。認証結果からGoogleカレンダー用の
 // アクセストークンを取り出し、保留中の取込があれば自動的に再開する。
+debugLog("calling auth.getRedirectResult()", null);
 auth.getRedirectResult().then(function(result){
-  console.log("[o2g] getRedirectResult resolved", { hasResult: !!result, hasUser: !!(result && result.user) });
-  if(!result || !result.user) return;
+  debugLog("getRedirectResult resolved", {
+    hasResult: !!result,
+    hasUser: !!(result && result.user),
+    userEmail: (result && result.user && result.user.email) || null,
+    operationType: result && result.operationType,
+    providerId: result && result.providerId
+  });
+  if(!result || !result.user){
+    debugLog("getRedirectResult: no result/user -> not a redirect return (normal on plain page load)", null);
+    return;
+  }
   var email = result.user.email;
   if(email !== ALLOWED_EMAIL){
+    debugLog("getRedirectResult: email mismatch, signing out", { got: email, expected: ALLOWED_EMAIL });
     auth.signOut();
     $("signinError").style.display = "block";
     $("signinError").textContent = "このアプリは " + ALLOWED_EMAIL + " 専用です。別のアカウントでログインされました。";
     return;
   }
   var cred = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+  debugLog("credentialFromResult", { hasCred: !!cred, hasAccessToken: !!(cred && cred.accessToken), tokenLen: cred && cred.accessToken ? cred.accessToken.length : 0 });
   if(cred && cred.accessToken){
     accessToken = cred.accessToken;
     accessTokenAt = Date.now();
+    debugLog("access token stored, resuming pending import if any", null);
     showToast("Googleカレンダーへのアクセス権を確認しました", "ok");
     maybeResumePendingImport();
   } else {
+    debugLog("no accessToken on credential -> scope not granted?", null);
     showToast("Googleカレンダーへのアクセス権を取得できませんでした。データアクセスのスコープ設定をご確認ください。", "err");
   }
 }).catch(function(err){
-  console.error(err);
+  debugLog("getRedirectResult() catch", { code: err && err.code, message: err && err.message });
   $("signinError").style.display = "block";
   $("signinError").textContent = "ログインに失敗しました: " + err.message;
 });
@@ -644,6 +792,7 @@ function hasValidAccessToken(){
 }
 
 auth.onAuthStateChanged(function(user){
+  debugLog("onAuthStateChanged", { hasUser: !!user, email: user && user.email });
   if(user && user.email === ALLOWED_EMAIL){
     currentUser = user;
     $("signinScreen").style.display = "none";
@@ -826,9 +975,10 @@ $("importBtn").addEventListener("click", function(){
     var ev = eventsById[id];
     return ev && ev.selected && !ev.importedToGoogle;
   });
-  console.log("[o2g] importBtn clicked", { selIds: selIds.length, hasValidAccessToken: hasValidAccessToken() });
+  debugLog("importBtn clicked", { selIds: selIds.length, hasValidAccessToken: hasValidAccessToken(), hasAccessToken: !!accessToken, accessTokenAgeMs: accessToken ? (Date.now()-accessTokenAt) : null });
   if(!selIds.length) return;
   if(!hasValidAccessToken()){
+    debugLog("importBtn: no valid access token -> saving pending and signInWithRedirect", { selIds: selIds.length });
     savePendingImport(selIds);
     showToast("カレンダーへのアクセス権を確認します。Googleのログイン画面に移動します…", "ok");
     setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
@@ -855,6 +1005,7 @@ function eventToGoogleBody(ev){
 }
 
 function runImport(ids, token){
+  debugLog("runImport start", { count: ids.length, tokenLen: token ? token.length : 0 });
   $("progressBg").style.display = "flex";
   $("progressBar").style.width = "0%";
   $("progressMsg").textContent = "0 / " + ids.length + " 件";
@@ -865,6 +1016,7 @@ function runImport(ids, token){
     $("progressBg").style.display = "none";
     var msg = "取込完了: 成功 " + ok + " 件";
     if(fail) msg += " / 失敗 " + fail + " 件";
+    debugLog("runImport finish", { ok: ok, fail: fail, failMessages: failMessages });
     showToast(msg, fail ? "err" : "ok");
     if(failMessages.length) console.warn("Import failures:", failMessages);
   }
@@ -872,6 +1024,7 @@ function runImport(ids, token){
   // トークンが途中で失効(401)した場合は、残りの予定IDを保存していったん
   // 再認証(リダイレクト)へ。戻ってきたら自動的に残りを再開する。
   function reauthAndResume(remainingIds){
+    debugLog("runImport: 401 unauthorized, saving pending and re-authing", { remaining: remainingIds.length });
     $("progressBg").style.display = "none";
     savePendingImport(remainingIds);
     showToast("アクセス権限の期限が切れました。再度Googleへのログインが必要です…", "err");
@@ -895,6 +1048,7 @@ function runImport(ids, token){
       if(r.unauthorized){ reauthAndResume(ids.slice(i)); return; }
       if(r.res.ok){
         ok++;
+        debugLog("runImport step ok", { i: i, id: id, subject: ev.subject, googleEventId: r.data.id });
         db.ref("events/" + id).update({
           importedToGoogle: true,
           googleEventId: r.data.id || null,
@@ -902,13 +1056,16 @@ function runImport(ids, token){
         });
       } else {
         fail++;
-        failMessages.push((ev.subject||id) + ": " + (r.data && r.data.error && r.data.error.message || r.res.status));
+        var errMsg = (ev.subject||id) + ": " + (r.data && r.data.error && r.data.error.message || r.res.status);
+        debugLog("runImport step FAILED", { i: i, id: id, status: r.res.status, error: r.data && r.data.error });
+        failMessages.push(errMsg);
       }
       $("progressBar").style.width = Math.round(((i+1)/ids.length)*100) + "%";
       $("progressMsg").textContent = (i+1) + " / " + ids.length + " 件";
       step(i+1);
     }).catch(function(err){
       fail++;
+      debugLog("runImport step fetch() threw", { i: i, id: id, message: err && err.message });
       failMessages.push((ev.subject||id) + ": " + err.message);
       $("progressBar").style.width = Math.round(((i+1)/ids.length)*100) + "%";
       $("progressMsg").textContent = (i+1) + " / " + ids.length + " 件";
