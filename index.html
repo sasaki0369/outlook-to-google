@@ -333,6 +333,7 @@ var accessTokenAt = 0;
 var eventsById = {};         // Firebaseから同期される全予定
 var selected = {};           // {id: true} ローカル選択状態(Firebaseにも保存)
 var lastImportAt = null;     // 直近のCSV取込日時(ms) - 表示対象期間の起点としてFirebaseで端末間共有
+var lastImportCount = null;  // 直近に読み込んだCSV自体の件数(「全◯件中」の分母に使う) - 端末間で共有
 var searchValue = "";
 var unimportedOnlyValue = true; // デフォルトで「未取込のみ」表示。HTML側のcheckedと合わせる
 var deferredInstallPrompt = null;
@@ -757,6 +758,9 @@ function mergeIntoFirebase(parsedEvents){
   });
   // 表示対象期間(取込日時から7日間)の起点として、最終取込日時を端末間で共有する
   updates["meta/lastImportAt"] = importTimestamp;
+  // 一覧の分母(「全◯件中」)は、Firebase累積の全件数ではなく、直近に読み込んだ
+  // CSV自体の件数を表示したいため、その件数も端末間で共有しておく
+  updates["meta/lastImportCount"] = parsedEvents.length;
   db.ref().update(updates).then(function(){
     showToast(parsedEvents.length + "件読み込み完了(新規 " + newCount + "件 / 更新 " + updateCount + "件)", "ok");
   }).catch(function(err){
@@ -778,6 +782,10 @@ function listenEvents(){
 function listenMeta(){
   db.ref("meta/lastImportAt").on("value", function(snap){
     lastImportAt = snap.val() || null;
+    render();
+  });
+  db.ref("meta/lastImportCount").on("value", function(snap){
+    lastImportCount = snap.val() || null;
     render();
   });
 }
@@ -890,6 +898,9 @@ function render(){
   }
   var ids = getFilteredSortedIds();
   var root = $("listRoot");
+  // 「全◯件中」の分母は、Firebaseに累積された全予定数ではなく、直近に読み込んだ
+  // CSV自体の件数を使う(lastImportCountが未設定の古いデータの場合のみ累積数にフォールバック)
+  var denomCount = (lastImportCount != null) ? lastImportCount : Object.keys(eventsById).length;
 
   if(!Object.keys(eventsById).length){
     root.innerHTML = '<div class="empty">📄<br>まだ予定が取り込まれていません。<br>上の「CSVを選択して取り込む」からOutlookの予定表CSVを読み込んでください。</div>';
@@ -899,7 +910,7 @@ function render(){
   }
   if(!ids.length){
     root.innerHTML = '<div class="empty">🔍<br>表示期間内（' + formatShortDate(win.start) + '〜' + formatShortDate(win.end) + '）に該当する予定がありません。<br>検索条件や「未取込のみ」の設定もご確認ください。</div>';
-    $("statusLine").textContent = "全 " + Object.keys(eventsById).length + " 件中 0 件を表示";
+    $("statusLine").textContent = "全 " + denomCount + " 件中 0 件を表示";
     updateFabBar(ids);
     return;
   }
@@ -944,7 +955,7 @@ function render(){
     html += '</div>';
   });
   root.innerHTML = html;
-  $("statusLine").textContent = "全 " + Object.keys(eventsById).length + " 件中 " + ids.length + " 件を表示";
+  $("statusLine").textContent = "全 " + denomCount + " 件中 " + ids.length + " 件を表示";
   updateFabBar(ids);
 }
 
