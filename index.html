@@ -294,6 +294,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-database-compat.js"></script>
+<script src="https://accounts.google.com/gsi/client"></script>
 
 <script>
 (function(){
@@ -311,9 +312,9 @@ var firebaseConfig = {
 };
 var ALLOWED_EMAIL = "sasaki0369@gmail.com";
 var CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+var GOOGLE_OAUTH_CLIENT_ID = "790653257684-ahd10dldur9c8vmbv71djsd3efbe1dh5.apps.googleusercontent.com";
 var TITLE_PREFIX = "【会議録】";
-var TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // Firebase発行のOAuthアクセストークンは約1時間有効。安全側で50分。
-var PENDING_IMPORT_KEY = "o2g_pending_import";
+var TOKEN_MAX_AGE_MS = 50 * 60 * 1000; // Googleのアクセストークンは約1時間有効。安全側で50分。
 
 firebase.initializeApp(firebaseConfig);
 var auth = firebase.auth();
@@ -329,7 +330,6 @@ var lastImportAt = null;     // 直近のCSV取込日時(ms) - 表示対象期�
 var searchValue = "";
 var unimportedOnlyValue = true; // デフォルトで「未取込のみ」表示。HTML側のcheckedと合わせる
 var deferredInstallPrompt = null;
-var pendingImportIds = null; // Google再認証(リダイレクト)から戻った直後に再開する取込ID一覧
 
 /* ========================= デバッグログ =========================
    OAuthのリダイレクト遷移をまたいでも消えないよう、console.logではなく
@@ -414,44 +414,80 @@ document.getElementById("debugCopyBtn").addEventListener("click", function(){
   }
 });
 
-// GitHub PagesはCross-Origin-Opener-Policyヘッダーを送出しており、
-// signInWithPopup()のポップアップ監視(window.closed)がブラウザにブロックされてしまう。
-// そのため本アプリはポップアップ方式を使わず、常にsignInWithRedirect(全画面遷移)で認証する。
-function savePendingImport(ids){
-  try{ sessionStorage.setItem(PENDING_IMPORT_KEY, JSON.stringify(ids)); }catch(e){ /* no-op */ }
-}
-function loadPendingImport(){
-  try{
-    var raw = sessionStorage.getItem(PENDING_IMPORT_KEY);
-    if(!raw) return null;
-    sessionStorage.removeItem(PENDING_IMPORT_KEY);
-    var ids = JSON.parse(raw);
-    return Array.isArray(ids) && ids.length ? ids : null;
-  }catch(e){ return null; }
-}
-function maybeResumePendingImport(){
-  debugLog("maybeResumePendingImport check", {
-    pendingImportIds: pendingImportIds,
-    hasAccessToken: !!accessToken,
-    eventsLoaded: Object.keys(eventsById).length
+// 【認証方式について】
+// 当初はFirebase Authのsignin WithRedirect(全画面遷移)で実装していたが、
+// アプリの実行ドメイン(GitHub Pages)とFirebaseの認証ドメイン(life--log.firebaseapp.com)が
+// 異なるため、認証結果の受け渡しにクロスオリジンのiframe/ストレージアクセスが必要になり、
+// 最近のブラウザ(Chrome/Edge等)のサードパーティストレージ制限でその受け渡しが失敗し、
+// 「ログインはできているのにアクセストークンだけ受け取れない」という問題が起きていた。
+// そのため、Googleカレンダーへのアクセス許可はFirebaseの認証フローを経由せず、
+// Google Identity Services(GIS)ライブラリのOAuthトークンクライアントで直接取得する方式に変更した。
+// 取得したアクセストークンはそのままGoogleカレンダーAPI呼び出しに使い、
+// 同時にfirebase.auth.GoogleAuthProvider.credential()経由でFirebaseにもサインインさせることで、
+// Realtime Databaseのセキュリティルール(メールアドレス一致チェック)もそのまま機能させる。
+// ポップアップは開くが、GISはこの種のブラウザ制限を前提に設計されているため
+// (Firebase側のsignInWithPopupと違い)ページ遷移なしで確実に結果を受け取れる。
+var tokenClient = null;
+function getTokenClient(){
+  if(tokenClient) return tokenClient;
+  if(!(window.google && google.accounts && google.accounts.oauth2)) return null;
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_OAUTH_CLIENT_ID,
+    scope: "openid email profile " + CALENDAR_SCOPE,
+    callback: function(){}
   });
-  if(!pendingImportIds || !accessToken) return;
-  if(!Object.keys(eventsById).length) return; // Firebaseの初回読み込み待ち
-  var ids = pendingImportIds.filter(function(id){
-    return eventsById[id] && !eventsById[id].importedToGoogle;
-  });
-  pendingImportIds = null;
-  debugLog("resuming import for N events", ids.length);
-  if(ids.length){
-    showToast("ログインが完了しました。保留していた取込を再開します…", "ok");
-    runImport(ids, accessToken);
+  return tokenClient;
+}
+// tokenResponseからFirebaseへのサインインまでを行う共通処理。
+function handleTokenResponse(tokenResponse, onDone){
+  if(!tokenResponse || tokenResponse.error){
+    debugLog("GISトークン取得エラー", tokenResponse);
+    onDone && onDone(new Error((tokenResponse && tokenResponse.error) || "unknown_error"));
+    return;
   }
+  var token = tokenResponse.access_token;
+  debugLog("GISアクセストークン取得", { tokenLen: token ? token.length : 0, scope: tokenResponse.scope });
+  var cred = firebase.auth.GoogleAuthProvider.credential(null, token);
+  auth.signInWithCredential(cred).then(function(result){
+    var email = result.user && result.user.email;
+    debugLog("signInWithCredential 成功", { email: email });
+    if(email !== ALLOWED_EMAIL){
+      debugLog("メールアドレス不一致のためサインアウト", { got: email, expected: ALLOWED_EMAIL });
+      auth.signOut();
+      accessToken = null;
+      $("signinError").style.display = "block";
+      $("signinError").textContent = "このアプリは " + ALLOWED_EMAIL + " 専用です。別のアカウントでログインされました。";
+      onDone && onDone(new Error("email_mismatch"));
+      return;
+    }
+    accessToken = token;
+    accessTokenAt = Date.now();
+    onDone && onDone(null, token);
+  }).catch(function(err){
+    debugLog("signInWithCredential 失敗", { code: err && err.code, message: err && err.message });
+    onDone && onDone(err);
+  });
 }
-// ページ読み込み時点で、再認証リダイレクトの直前に保存しておいた取込予定IDがあれば復元しておく。
-// (これが無いと、リダイレクトから戻ってきてもどの予定を取り込む予定だったか分からず、
-//  取込が静かに何も起きないまま終わってしまう)
-pendingImportIds = loadPendingImport();
-debugLog("page load, restored pendingImportIds", pendingImportIds);
+// promptMode: "consent"(常に同意画面を表示) または ""(可能ならサイレントに更新、失敗したらconsentへ自動フォールバック)
+function requestGoogleAuth(promptMode, onDone){
+  var client = getTokenClient();
+  if(!client){
+    debugLog("Google Identity Servicesが未読み込み", null);
+    showToast("Google認証ライブラリを読み込み中です。数秒後にもう一度お試しください。", "err");
+    onDone && onDone(new Error("gis_not_ready"));
+    return;
+  }
+  client.callback = function(tokenResponse){
+    if(tokenResponse && tokenResponse.error && promptMode !== "consent"){
+      debugLog("サイレント認証に失敗、consentプロンプトへフォールバック", tokenResponse);
+      requestGoogleAuth("consent", onDone);
+      return;
+    }
+    handleTokenResponse(tokenResponse, onDone);
+  };
+  debugLog("requestAccessToken呼び出し", { promptMode: promptMode });
+  client.requestAccessToken({ prompt: promptMode, hint: ALLOWED_EMAIL });
+}
 debugLog("page load, location.href", location.href);
 
 /* ========================= ユーティリティ ========================= */
@@ -723,68 +759,30 @@ function listenMeta(){
 }
 
 /* ========================= 認証 ========================= */
-function buildGoogleProvider(){
-  var provider = new firebase.auth.GoogleAuthProvider();
-  provider.addScope(CALENDAR_SCOPE);
-  provider.setCustomParameters({ login_hint: ALLOWED_EMAIL, prompt: "consent" });
-  return provider;
-}
-
 $("signInBtn").addEventListener("click", function(){
   $("signinError").style.display = "none";
-  debugLog("signInBtn clicked -> signInWithRedirect()", null);
-  auth.signInWithRedirect(buildGoogleProvider()).catch(function(err){
-    debugLog("signInWithRedirect() catch (signInBtn)", { code: err && err.code, message: err && err.message });
-    $("signinError").style.display = "block";
-    $("signinError").textContent = "ログインに失敗しました: " + err.message;
+  debugLog("signInBtn clicked -> requestGoogleAuth(consent)", null);
+  requestGoogleAuth("consent", function(err){
+    if(err){
+      if(err.message !== "email_mismatch"){
+        $("signinError").style.display = "block";
+        $("signinError").textContent = "ログインに失敗しました: " + err.message;
+      }
+      return;
+    }
+    showToast("Googleカレンダーへのアクセス権を確認しました", "ok");
   });
 });
 
 $("refreshTokenBtn").addEventListener("click", function(){
-  debugLog("refreshTokenBtn clicked -> signInWithRedirect() (after 500ms)", null);
-  showToast("Googleのログイン画面に移動します…", "ok");
-  setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
-});
-
-// リダイレクトで戻ってきた直後に一度だけ呼ばれる。認証結果からGoogleカレンダー用の
-// アクセストークンを取り出し、保留中の取込があれば自動的に再開する。
-debugLog("calling auth.getRedirectResult()", null);
-auth.getRedirectResult().then(function(result){
-  debugLog("getRedirectResult resolved", {
-    hasResult: !!result,
-    hasUser: !!(result && result.user),
-    userEmail: (result && result.user && result.user.email) || null,
-    operationType: result && result.operationType,
-    providerId: result && result.providerId
+  debugLog("refreshTokenBtn clicked -> requestGoogleAuth('')", null);
+  requestGoogleAuth("", function(err){
+    if(err){
+      showToast("カレンダー権限の更新に失敗しました: " + err.message, "err");
+      return;
+    }
+    showToast("カレンダー権限を更新しました", "ok");
   });
-  if(!result || !result.user){
-    debugLog("getRedirectResult: no result/user -> not a redirect return (normal on plain page load)", null);
-    return;
-  }
-  var email = result.user.email;
-  if(email !== ALLOWED_EMAIL){
-    debugLog("getRedirectResult: email mismatch, signing out", { got: email, expected: ALLOWED_EMAIL });
-    auth.signOut();
-    $("signinError").style.display = "block";
-    $("signinError").textContent = "このアプリは " + ALLOWED_EMAIL + " 専用です。別のアカウントでログインされました。";
-    return;
-  }
-  var cred = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-  debugLog("credentialFromResult", { hasCred: !!cred, hasAccessToken: !!(cred && cred.accessToken), tokenLen: cred && cred.accessToken ? cred.accessToken.length : 0 });
-  if(cred && cred.accessToken){
-    accessToken = cred.accessToken;
-    accessTokenAt = Date.now();
-    debugLog("access token stored, resuming pending import if any", null);
-    showToast("Googleカレンダーへのアクセス権を確認しました", "ok");
-    maybeResumePendingImport();
-  } else {
-    debugLog("no accessToken on credential -> scope not granted?", null);
-    showToast("Googleカレンダーへのアクセス権を取得できませんでした。データアクセスのスコープ設定をご確認ください。", "err");
-  }
-}).catch(function(err){
-  debugLog("getRedirectResult() catch", { code: err && err.code, message: err && err.message });
-  $("signinError").style.display = "block";
-  $("signinError").textContent = "ログインに失敗しました: " + err.message;
 });
 
 function hasValidAccessToken(){
@@ -860,7 +858,6 @@ function getFilteredSortedIds(){
 }
 
 function render(){
-  maybeResumePendingImport();
   var win = getDisplayWindow();
   if(Object.keys(eventsById).length){
     $("windowLine").textContent = "表示期間: " + formatShortDate(win.start) + " 〜 " + formatShortDate(win.end) + "（取込日時を起点に7日間。範囲外の予定は表示されません）";
@@ -978,10 +975,17 @@ $("importBtn").addEventListener("click", function(){
   debugLog("importBtn clicked", { selIds: selIds.length, hasValidAccessToken: hasValidAccessToken(), hasAccessToken: !!accessToken, accessTokenAgeMs: accessToken ? (Date.now()-accessTokenAt) : null });
   if(!selIds.length) return;
   if(!hasValidAccessToken()){
-    debugLog("importBtn: no valid access token -> saving pending and signInWithRedirect", { selIds: selIds.length });
-    savePendingImport(selIds);
-    showToast("カレンダーへのアクセス権を確認します。Googleのログイン画面に移動します…", "ok");
-    setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 500);
+    debugLog("importBtn: no valid access token -> requestGoogleAuth", { selIds: selIds.length });
+    showToast("カレンダーへのアクセス権を確認しています…", "ok");
+    requestGoogleAuth("", function(err){
+      if(err){
+        if(err.message !== "email_mismatch"){
+          showToast("カレンダーへのアクセス権を取得できませんでした: " + err.message, "err");
+        }
+        return;
+      }
+      runImport(selIds, accessToken);
+    });
     return;
   }
   runImport(selIds, accessToken);
@@ -1021,14 +1025,24 @@ function runImport(ids, token){
     if(failMessages.length) console.warn("Import failures:", failMessages);
   }
 
-  // トークンが途中で失効(401)した場合は、残りの予定IDを保存していったん
-  // 再認証(リダイレクト)へ。戻ってきたら自動的に残りを再開する。
+  // トークンが途中で失効(401)した場合は、その場でGoogleのトークンを取り直し、
+  // ページ遷移なしで残りの予定の取込を続行する。
   function reauthAndResume(remainingIds){
-    debugLog("runImport: 401 unauthorized, saving pending and re-authing", { remaining: remainingIds.length });
-    $("progressBg").style.display = "none";
-    savePendingImport(remainingIds);
-    showToast("アクセス権限の期限が切れました。再度Googleへのログインが必要です…", "err");
-    setTimeout(function(){ auth.signInWithRedirect(buildGoogleProvider()); }, 800);
+    debugLog("runImport: 401 unauthorized, re-authing in place", { remaining: remainingIds.length });
+    showToast("アクセス権限の期限が切れました。再取得しています…", "err");
+    requestGoogleAuth("", function(err, newToken){
+      if(err){
+        $("progressBg").style.display = "none";
+        if(err.message !== "email_mismatch"){
+          showToast("再認証に失敗しました: " + err.message, "err");
+        }
+        return;
+      }
+      token = newToken;
+      showToast("アクセス権限を再取得しました。取込を続けます…", "ok");
+      var resumeFromIndex = ids.length - remainingIds.length;
+      step(resumeFromIndex);
+    });
   }
 
   function step(i){
