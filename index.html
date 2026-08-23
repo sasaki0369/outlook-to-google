@@ -236,6 +236,12 @@
       <button class="btn btn-sm btn-ghost" id="installBtn" type="button">追加する</button>
     </div>
 
+    <div class="install-banner" id="resumeBanner" style="display:none;">
+      <span>⚠️ アクセス権限の有効期限が切れました。続きを取り込むにはもう一度許可が必要です。</span>
+      <div class="spacer"></div>
+      <button class="btn btn-sm btn-primary" id="resumeImportBtn" type="button">続きを取り込む</button>
+    </div>
+
     <div class="toolbar">
       <div class="filerow">
         <label class="btn btn-outline btn-sm" for="csvInput">📄 CSVを選択して取り込む</label>
@@ -330,6 +336,7 @@ var lastImportAt = null;     // 直近のCSV取込日時(ms) - 表示対象期�
 var searchValue = "";
 var unimportedOnlyValue = true; // デフォルトで「未取込のみ」表示。HTML側のcheckedと合わせる
 var deferredInstallPrompt = null;
+var pendingResumeIds = null; // カレンダー取込の途中でアクセス権限が切れた際、再開待ちの予定ID一覧
 
 /* ========================= デバッグログ =========================
    OAuthのリダイレクト遷移をまたいでも消えないよう、console.logではなく
@@ -433,10 +440,26 @@ function getTokenClient(){
   if(!(window.google && google.accounts && google.accounts.oauth2)) return null;
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: GOOGLE_OAUTH_CLIENT_ID,
-    scope: "openid email profile " + CALENDAR_SCOPE,
+    // 'openid'はID token発行(OIDC)向けのスコープでこのトークンクライアント(暗黙的フロー)では
+    // 使わないため含めない。email/profileはFirebase側がuserinfoエンドポイントでメールアドレスを
+    // 確認するために必要。
+    scope: "email profile " + CALENDAR_SCOPE,
     callback: function(){}
   });
   return tokenClient;
+}
+// 診断用: 取得したアクセストークンが実際にどのGoogleアカウント・スコープに紐づいているかを
+// Google自身のuserinfoエンドポイントで確認し、デバッグログに残す(結果を待たずに進める)。
+function debugCheckUserinfo(token){
+  fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { "Authorization": "Bearer " + token }
+  }).then(function(res){
+    return res.json().then(function(data){ return { status: res.status, data: data }; });
+  }).then(function(r){
+    debugLog("userinfoエンドポイント確認", { status: r.status, email: r.data && r.data.email, email_verified: r.data && r.data.email_verified });
+  }).catch(function(err){
+    debugLog("userinfoエンドポイント確認 失敗", { message: err && err.message });
+  });
 }
 // tokenResponseからFirebaseへのサインインまでを行う共通処理。
 function handleTokenResponse(tokenResponse, onDone){
@@ -447,6 +470,7 @@ function handleTokenResponse(tokenResponse, onDone){
   }
   var token = tokenResponse.access_token;
   debugLog("GISアクセストークン取得", { tokenLen: token ? token.length : 0, scope: tokenResponse.scope });
+  debugCheckUserinfo(token);
   var cred = firebase.auth.GoogleAuthProvider.credential(null, token);
   auth.signInWithCredential(cred).then(function(result){
     var email = result.user && result.user.email;
@@ -967,6 +991,23 @@ function updateFabBar(visibleIds){
 }
 
 /* ========================= Googleカレンダー取込 ========================= */
+$("resumeImportBtn").addEventListener("click", function(){
+  $("resumeBanner").style.display = "none";
+  var ids = pendingResumeIds;
+  pendingResumeIds = null;
+  if(!ids || !ids.length) return;
+  debugLog("resumeImportBtn clicked", { count: ids.length });
+  requestGoogleAuth("", function(err){
+    if(err){
+      if(err.message !== "email_mismatch"){
+        showToast("再認証に失敗しました: " + err.message, "err");
+      }
+      return;
+    }
+    runImport(ids, accessToken);
+  });
+});
+
 $("importBtn").addEventListener("click", function(){
   var selIds = getCandidateIds().filter(function(id){
     var ev = eventsById[id];
@@ -1010,6 +1051,7 @@ function eventToGoogleBody(ev){
 
 function runImport(ids, token){
   debugLog("runImport start", { count: ids.length, tokenLen: token ? token.length : 0 });
+  $("resumeBanner").style.display = "none"; // 新しい取込が始まったら、古い「続きを取り込む」表示は消す
   $("progressBg").style.display = "flex";
   $("progressBar").style.width = "0%";
   $("progressMsg").textContent = "0 / " + ids.length + " 件";
@@ -1025,24 +1067,18 @@ function runImport(ids, token){
     if(failMessages.length) console.warn("Import failures:", failMessages);
   }
 
-  // トークンが途中で失効(401)した場合は、その場でGoogleのトークンを取り直し、
-  // ページ遷移なしで残りの予定の取込を続行する。
+  // トークンが途中で失効(401)した場合。
+  // 注意: ここは「Googleカレンダーに取り込む」クリックから何回もの非同期処理を経た後の
+  // コールバックの中なので、ここでいきなり認証ポップアップを開こうとすると、
+  // ブラウザがユーザー操作に基づかないポップアップとしてブロックしてしまう可能性がある。
+  // そのため自動では再認証せず、「続きを取り込む」ボタンを表示してユーザーの
+  // クリックをきっかけに再認証する(そのクリック自体が正当なユーザー操作になる)。
   function reauthAndResume(remainingIds){
-    debugLog("runImport: 401 unauthorized, re-authing in place", { remaining: remainingIds.length });
-    showToast("アクセス権限の期限が切れました。再取得しています…", "err");
-    requestGoogleAuth("", function(err, newToken){
-      if(err){
-        $("progressBg").style.display = "none";
-        if(err.message !== "email_mismatch"){
-          showToast("再認証に失敗しました: " + err.message, "err");
-        }
-        return;
-      }
-      token = newToken;
-      showToast("アクセス権限を再取得しました。取込を続けます…", "ok");
-      var resumeFromIndex = ids.length - remainingIds.length;
-      step(resumeFromIndex);
-    });
+    debugLog("runImport: 401 unauthorized, showing resume banner", { remaining: remainingIds.length });
+    $("progressBg").style.display = "none";
+    pendingResumeIds = remainingIds;
+    $("resumeBanner").style.display = "flex";
+    showToast("アクセス権限の期限が切れました。「続きを取り込む」から再開してください。", "err");
   }
 
   function step(i){
