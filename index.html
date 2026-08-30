@@ -716,8 +716,10 @@ function mergeIntoFirebase(parsedEvents){
   var updates = {};
   var newCount = 0, updateCount = 0;
   var importTimestamp = Date.now();
+  var keepIds = {}; // 今回のCSVに含まれる予定のID(この予定だけを残し、それ以外は削除する)
   parsedEvents.forEach(function(ev){
     var id = stableEventId(ev);
+    keepIds[id] = true;
     var existing = eventsById[id];
     var payload = {
       subject: ev.subject,
@@ -747,14 +749,17 @@ function mergeIntoFirebase(parsedEvents){
     }
     updates["events/" + id] = payload;
   });
-  // 今回のCSVに含まれなかった予定でも、選択状態が残っていれば必ずリセットする
-  // (表示期間の外に残っていた古い選択が、件数カウントに紛れ込むのを防ぐ)
+  // スケジュールは更新のたびに内容が変わっていくため、過去の取込分をいつまでも残すと
+  // どれが最新か分からなくなる。そのため、今回のCSVに含まれない予定はここで削除し、
+  // 常に「直近に読み込んだCSVの内容だけ」が残るようにする
+  // (ただし同じ予定が引き続き含まれている場合は、上のループでID一致により
+  //  importedToGoogle等の状態はそのまま引き継がれるので、取込済みの予定を
+  //  再取込・重複登録してしまうことはない)。
+  var removeCount = 0;
   Object.keys(eventsById).forEach(function(id){
-    if(updates["events/" + id] !== undefined) return; // 上のループで既に選択リセット済み
-    var ev = eventsById[id];
-    if(ev && ev.selected){
-      updates["events/" + id + "/selected"] = false;
-    }
+    if(keepIds[id]) return;
+    updates["events/" + id] = null;
+    removeCount++;
   });
   // 表示対象期間(取込日時から7日間)の起点として、最終取込日時を端末間で共有する
   updates["meta/lastImportAt"] = importTimestamp;
@@ -762,7 +767,7 @@ function mergeIntoFirebase(parsedEvents){
   // CSV自体の件数を表示したいため、その件数も端末間で共有しておく
   updates["meta/lastImportCount"] = parsedEvents.length;
   db.ref().update(updates).then(function(){
-    showToast(parsedEvents.length + "件読み込み完了(新規 " + newCount + "件 / 更新 " + updateCount + "件)", "ok");
+    showToast(parsedEvents.length + "件読み込み完了(新規 " + newCount + "件 / 更新 " + updateCount + "件 / 削除 " + removeCount + "件)", "ok");
   }).catch(function(err){
     console.error(err);
     showToast("Firebaseへの保存に失敗しました: " + err.message, "err");
