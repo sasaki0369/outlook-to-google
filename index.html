@@ -464,6 +464,28 @@ function debugCheckUserinfo(token){
     debugLog("userinfoエンドポイント確認 失敗", { message: err && err.message });
   });
 }
+// Firebaseへのサインインをやり直さずに、Googleカレンダー用アクセストークンだけが
+// 正しいアカウント(ALLOWED_EMAIL)のものであるかをuserinfoエンドポイントで確認する。
+// (Firebaseの認証セッションは既に確立済みであることが前提の呼び出し元でのみ使う)
+function verifyTokenEmail(token, onDone){
+  fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { "Authorization": "Bearer " + token }
+  }).then(function(res){
+    return res.json().then(function(data){ return { status: res.status, data: data }; });
+  }).then(function(r){
+    debugLog("userinfoエンドポイント確認(カレンダートークンのみ更新)", { status: r.status, email: r.data && r.data.email });
+    if(r.status === 200 && r.data && r.data.email === ALLOWED_EMAIL){
+      onDone(null);
+    } else {
+      onDone(new Error("email_mismatch"));
+    }
+  }).catch(function(err){
+    // userinfo確認自体が失敗した場合は、念のためトークンは信用して先に進める
+    // (誤ったアカウントのトークンであればCalendar API呼び出し側が別途エラーになる)
+    debugLog("userinfoエンドポイント確認 失敗(処理は続行)", { message: err && err.message });
+    onDone(null);
+  });
+}
 // tokenResponseからFirebaseへのサインインまでを行う共通処理。
 // 【既知の問題への対処】Googleへのアクセストークンのみを使うsignInWithCredential()は、
 // Firebase側がGoogleの検証エンドポイントへサーバー間通信で問い合わせて確認する仕組みのため、
@@ -524,7 +546,14 @@ function friendlyAuthErrorMessage(err){
   return (err && err.message) || "不明なエラー";
 }
 // promptMode: "consent"(常に同意画面を表示) または ""(可能ならサイレントに更新、失敗したらconsentへ自動フォールバック)
-function requestGoogleAuth(promptMode, onDone){
+// requireFirebaseAuth: true の場合のみ、取得したアクセストークンでFirebaseへの
+//   signInWithCredential()もやり直す(初回サインイン用)。
+//   false(既定)の場合は、Firebaseのセッションは既に確立済みという前提で、
+//   Googleカレンダー用アクセストークンの取得とuserinfoでのアカウント確認だけを行い、
+//   Google側の検証エンドポイントが不安定な signInWithCredential() は呼ばない。
+//   (このエンドポイントは呼ぶたびに稀に一時的な失敗を返すため、本当に必要な
+//   初回サインイン時以外は呼ばないようにして、権限更新の失敗を減らしている)
+function requestGoogleAuth(promptMode, onDone, requireFirebaseAuth){
   var client = getTokenClient();
   if(!client){
     debugLog("Google Identity Servicesが未読み込み", null);
@@ -535,12 +564,32 @@ function requestGoogleAuth(promptMode, onDone){
   client.callback = function(tokenResponse){
     if(tokenResponse && tokenResponse.error && promptMode !== "consent"){
       debugLog("サイレント認証に失敗、consentプロンプトへフォールバック", tokenResponse);
-      requestGoogleAuth("consent", onDone);
+      requestGoogleAuth("consent", onDone, requireFirebaseAuth);
       return;
     }
-    handleTokenResponse(tokenResponse, onDone);
+    if(!tokenResponse || tokenResponse.error){
+      debugLog("GISトークン取得エラー", tokenResponse);
+      onDone && onDone(new Error((tokenResponse && tokenResponse.error) || "unknown_error"));
+      return;
+    }
+    if(requireFirebaseAuth){
+      handleTokenResponse(tokenResponse, onDone);
+      return;
+    }
+    var token = tokenResponse.access_token;
+    debugLog("GISアクセストークン取得(カレンダートークンのみ更新)", { tokenLen: token ? token.length : 0, scope: tokenResponse.scope });
+    verifyTokenEmail(token, function(err){
+      if(err){
+        debugLog("メールアドレス不一致のためトークンを破棄", { expected: ALLOWED_EMAIL });
+        onDone && onDone(err);
+        return;
+      }
+      accessToken = token;
+      accessTokenAt = Date.now();
+      onDone && onDone(null, token);
+    });
   };
-  debugLog("requestAccessToken呼び出し", { promptMode: promptMode });
+  debugLog("requestAccessToken呼び出し", { promptMode: promptMode, requireFirebaseAuth: !!requireFirebaseAuth });
   client.requestAccessToken({ prompt: promptMode, hint: ALLOWED_EMAIL });
 }
 debugLog("page load, location.href", location.href);
@@ -838,7 +887,7 @@ $("signInBtn").addEventListener("click", function(){
       return;
     }
     showToast("Googleカレンダーへのアクセス権を確認しました", "ok");
-  });
+  }, /* requireFirebaseAuth */ true);
 });
 
 $("refreshTokenBtn").addEventListener("click", function(){
