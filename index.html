@@ -465,19 +465,29 @@ function debugCheckUserinfo(token){
   });
 }
 // tokenResponseからFirebaseへのサインインまでを行う共通処理。
-function handleTokenResponse(tokenResponse, onDone){
+// 【既知の問題への対処】Googleへのアクセストークンのみを使うsignInWithCredential()は、
+// Firebase側がGoogleの検証エンドポイントへサーバー間通信で問い合わせて確認する仕組みのため、
+// トークン自体は正常でもそのエンドポイントが一時的に
+// 「Unsuccessful check authorization response from Google: Invalid Value」(auth/invalid-credential)
+// を返すことがある(他のアプリでも broadly 報告されている、Google側の一過性の不具合)。
+// このエラーに限り、同じトークンのまま少し待って自動的に再試行することで、
+// 利用者に再ログインを強いることなく大半のケースを吸収する。
+function handleTokenResponse(tokenResponse, onDone, retryCount){
+  retryCount = retryCount || 0;
   if(!tokenResponse || tokenResponse.error){
     debugLog("GISトークン取得エラー", tokenResponse);
     onDone && onDone(new Error((tokenResponse && tokenResponse.error) || "unknown_error"));
     return;
   }
   var token = tokenResponse.access_token;
-  debugLog("GISアクセストークン取得", { tokenLen: token ? token.length : 0, scope: tokenResponse.scope });
-  debugCheckUserinfo(token);
+  if(retryCount === 0){
+    debugLog("GISアクセストークン取得", { tokenLen: token ? token.length : 0, scope: tokenResponse.scope });
+    debugCheckUserinfo(token);
+  }
   var cred = firebase.auth.GoogleAuthProvider.credential(null, token);
   auth.signInWithCredential(cred).then(function(result){
     var email = result.user && result.user.email;
-    debugLog("signInWithCredential 成功", { email: email });
+    debugLog("signInWithCredential 成功", { email: email, retryCount: retryCount });
     if(email !== ALLOWED_EMAIL){
       debugLog("メールアドレス不一致のためサインアウト", { got: email, expected: ALLOWED_EMAIL });
       auth.signOut();
@@ -491,9 +501,27 @@ function handleTokenResponse(tokenResponse, onDone){
     accessTokenAt = Date.now();
     onDone && onDone(null, token);
   }).catch(function(err){
-    debugLog("signInWithCredential 失敗", { code: err && err.code, message: err && err.message });
+    debugLog("signInWithCredential 失敗", { code: err && err.code, message: err && err.message, retryCount: retryCount });
+    var isFlaky = err && err.code === "auth/invalid-credential";
+    if(isFlaky && retryCount < 2){
+      var delay = 700 * (retryCount + 1);
+      debugLog("Google側の一時的なエラーとみて再試行します", { nextRetryCount: retryCount + 1, delayMs: delay });
+      setTimeout(function(){
+        handleTokenResponse(tokenResponse, onDone, retryCount + 1);
+      }, delay);
+      return;
+    }
     onDone && onDone(err);
   });
+}
+// signInWithCredentialの失敗理由を、利用者にとって分かりやすい一言に変換する。
+// auth/invalid-credential はGoogle側の一時的な検証エラーであることが多く(自動リトライ後もなお失敗した場合)、
+// 生のエラーメッセージをそのまま出すより「もう一度試す」よう促す方が実態に合っている。
+function friendlyAuthErrorMessage(err){
+  if(err && err.code === "auth/invalid-credential"){
+    return "Google側の一時的なエラーで認証に失敗しました。もう一度ボタンを押してお試しください。";
+  }
+  return (err && err.message) || "不明なエラー";
 }
 // promptMode: "consent"(常に同意画面を表示) または ""(可能ならサイレントに更新、失敗したらconsentへ自動フォールバック)
 function requestGoogleAuth(promptMode, onDone){
@@ -805,7 +833,7 @@ $("signInBtn").addEventListener("click", function(){
     if(err){
       if(err.message !== "email_mismatch"){
         $("signinError").style.display = "block";
-        $("signinError").textContent = "ログインに失敗しました: " + err.message;
+        $("signinError").textContent = "ログインに失敗しました: " + friendlyAuthErrorMessage(err);
       }
       return;
     }
@@ -817,7 +845,7 @@ $("refreshTokenBtn").addEventListener("click", function(){
   debugLog("refreshTokenBtn clicked -> requestGoogleAuth('')", null);
   requestGoogleAuth("", function(err){
     if(err){
-      showToast("カレンダー権限の更新に失敗しました: " + err.message, "err");
+      showToast("カレンダー権限の更新に失敗しました: " + friendlyAuthErrorMessage(err), "err");
       return;
     }
     showToast("カレンダー権限を更新しました", "ok");
@@ -1042,7 +1070,7 @@ $("resumeImportBtn").addEventListener("click", function(){
   requestGoogleAuth("", function(err){
     if(err){
       if(err.message !== "email_mismatch"){
-        showToast("再認証に失敗しました: " + err.message, "err");
+        showToast("再認証に失敗しました: " + friendlyAuthErrorMessage(err), "err");
       }
       return;
     }
@@ -1063,7 +1091,7 @@ $("importBtn").addEventListener("click", function(){
     requestGoogleAuth("", function(err){
       if(err){
         if(err.message !== "email_mismatch"){
-          showToast("カレンダーへのアクセス権を取得できませんでした: " + err.message, "err");
+          showToast("カレンダーへのアクセス権を取得できませんでした: " + friendlyAuthErrorMessage(err), "err");
         }
         return;
       }
